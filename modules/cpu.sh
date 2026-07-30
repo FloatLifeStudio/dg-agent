@@ -1,175 +1,112 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 IFS=$'\n\t'
 
-cpu_socket=""
-cpu_core=""
-cpu_thread=""
+# 检查命令是否存在
+check_command() {
+    command -v "$1" > /dev/null 2>&1
+}
 
-declare -a cpu_models=()
+# 去除字符串首尾空白
+trim() {
 
-collect_from_lscpu() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
 
-    command -v lscpu > /dev/null 2>&1 || return 1
+}
 
-    local data
+# 保存 lscpu 输出
+declare -A CPU_INFO
 
-    data="$(lscpu)"
+# 采集 CPU 信息
+collect_cpu() {
 
-    cpu_socket="$(awk -F: '/Socket\(s\)/ {gsub(/ /,"",$2);print $2}' <<< "$data")"
+    local key
+    local value
 
-    cpu_core="$(awk -F: '/Core\(s\) per socket/ {
-        gsub(/ /,"",$2)
-        print $2
-    }' <<< "$data")"
+    while IFS=: read -r key value; do
+        key="$(trim "$key")"
+        value="$(trim "$value")"
+        [[ -z "$key" ]] && continue
+        CPU_INFO["$key"]="$value"
+    done < <(lscpu)
 
-    cpu_thread="$(awk -F: '/CPU\(s\)/ {
-        gsub(/ /,"",$2)
-        print $2
-        exit
-    }' <<< "$data")"
+}
 
+# 校验采集结果
+validate_cpu() {
+
+    [[ -n "${CPU_INFO["Architecture"]:-}" ]] || return 1
+    [[ -n "${CPU_INFO["Vendor ID"]:-}" ]] || return 1
+    [[ -n "${CPU_INFO["Model name"]:-}" ]] || return 1
+    [[ -n "${CPU_INFO["Socket(s)"]:-}" ]] || return 1
+    [[ -n "${CPU_INFO["Core(s) per socket"]:-}" ]] || return 1
+    [[ -n "${CPU_INFO["CPU(s)"]:-}" ]] || return 1
+
+}
+
+# 输出 JSON
+output_json() {
+
+    local socket_count
+    local cores_per_socket
+    local total_threads
+    local architecture
+    local vendor
     local model
 
-    model="$(awk -F: '
-        /Model name/ {
-            gsub(/^ +/,"",$2)
-            print $2
-            exit
-        }
-    ' <<< "$data")"
+    socket_count="${CPU_INFO["Socket(s)"]}"
+    cores_per_socket="${CPU_INFO["Core(s) per socket"]}"
+    total_threads="${CPU_INFO["CPU(s)"]}"
+    architecture="${CPU_INFO["Architecture"]}"
+    vendor="${CPU_INFO["Vendor ID"]}"
+    model="${CPU_INFO["Model name"]}"
 
-    if [ -n "$model" ]; then
+    jq -n \
+        --argjson socket_count "$socket_count" \
+        --argjson cores_per_socket "$cores_per_socket" \
+        --argjson total_threads "$total_threads" \
+        --arg architecture "$architecture" \
+        --arg vendor "$vendor" \
+        --arg model "$model" '
+    {
+        cpu_count: $socket_count,
+        cpu_cores: ($socket_count * $cores_per_socket),
+        cpu_threads: $total_threads,
+        cpu_processors: [
+            range(0; $socket_count)
+            |
+            {
+                cpu_socket: .,
+                cpu_vendor: $vendor,
+                cpu_model: $model,
+                cpu_architecture: $architecture,
+                cpu_cores: $cores_per_socket,
+                cpu_threads: ($total_threads / $socket_count)
+            }
+        ]
+    }'
 
-        local count
-
-        count="${cpu_socket:-1}"
-
-        for ((i = 0; i < count; i++)); do
-            cpu_models+=("$model")
-        done
-
-    fi
-
-    [ -n "$cpu_socket" ] \
-        && [ -n "$cpu_core" ] \
-        && [ -n "$cpu_thread" ] \
-        && [ "${#cpu_models[@]}" -gt 0 ]
-
-}
-
-collect_from_dmidecode() {
-
-    command -v dmidecode > /dev/null 2>&1 || return 1
-
-    local models
-
-    mapfile -t models < <(
-        dmidecode -t processor 2> /dev/null \
-            | awk -F: '
-        /Version:/ {
-            gsub(/^ +/,"",$2)
-
-            if ($2 != "")
-                print $2
-        }
-        '
-    )
-
-    [ "${#models[@]}" -eq 0 ] && return 1
-
-    cpu_models=("${models[@]}")
-
-    cpu_socket="${#cpu_models[@]}"
-
-    cpu_core="$(
-        dmidecode -t processor 2> /dev/null \
-            | awk -F: '
-        /Core Count:/ {
-            gsub(/^ +/,"",$2)
-            print $2
-            exit
-        }
-        '
-    )"
-
-    cpu_thread="$(
-        dmidecode -t processor 2> /dev/null \
-            | awk -F: '
-        /Thread Count:/ {
-            gsub(/^ +/,"",$2)
-            print $2
-            exit
-        }
-        '
-    )"
-
-    [ -n "$cpu_socket" ]
-}
-
-collect_from_sysfs() {
-
-    [ -r /proc/cpuinfo ] || return 1
-
-    local model
-
-    model="$(
-        awk -F: '
-        /model name/ {
-            gsub(/^ +/,"",$2)
-            print $2
-            exit
-        }
-        ' /proc/cpuinfo
-    )"
-
-    [ -z "$model" ] && return 1
-
-    cpu_socket=1
-
-    cpu_core="$(nproc --all 2> /dev/null || true)"
-
-    cpu_thread="$cpu_core"
-
-    cpu_models+=("$model")
-
-}
-
-output() {
-
-    local index=0
-
-    for model in "${cpu_models[@]}"; do
-        echo "cpu[${index}].model=${model}"
-        index=$((index + 1))
-    done
-
-    echo "cpu_socket=${cpu_socket}"
-    echo "cpu_core=${cpu_core}"
-    echo "cpu_thread=${cpu_thread}"
 }
 
 main() {
-
-    if ! collect_from_lscpu; then
-
-        cpu_models=()
-
-        if ! collect_from_dmidecode; then
-
-            cpu_models=()
-
-            if ! collect_from_sysfs; then
-                echo "ERROR cpu information unavailable" >&2
-                exit 1
-            fi
-
-        fi
-
-    fi
-
-    output
+    check_command lscpu || {
+        echo "ERROR missing command lscpu" >&2
+        exit 1
+    }
+    check_command jq || {
+        echo "ERROR missing command jq" >&2
+        exit 1
+    }
+    collect_cpu
+    validate_cpu || {
+        echo "ERROR cpu information unavailable" >&2
+        exit 1
+    }
+    output_json
 
 }
 
