@@ -3,97 +3,84 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# 检查依赖命令是否存在
-check_command() {
-    command -v "$1" > /dev/null 2>&1
+# 权限检测
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf '{"error":"root required (use sudo)"}\n' >&2
+    exit 5
+fi
+
+_trim() {
+    local str="${1-}"
+    str="${str#"${str%%[![:space:]]*}"}"
+    str="${str%"${str##*[![:space:]]}"}"
+    printf '%s' "$str"
 }
 
-# 全局变量保存 lsblk 原始输出
-LSBLK_JSON=""
-
-# 采集磁盘信息
-collect_disk() {
-    LSBLK_JSON="$(
-        lsblk \
-            -d \
-            -b \
-            -J \
-            -o NAME,VENDOR,MODEL,SIZE,ROTA,TRAN,SERIAL,TYPE \
-            2> /dev/null || true
-    )"
+_normalize() {
+    local val
+    val="$(_trim "${1-}")"
+    case "$val" in
+        '' | Unknown | unknown | None | 'N/A' | NA | No | none) printf '' ;;
+        *) printf '%s' "$val" ;;
+    esac
 }
 
-# 校验采集数据是否有效
-validate_disk() {
-    [[ -n "$LSBLK_JSON" ]] || return 1
-
-    local count
-    count="$(jq '[.blockdevices[]? | select(.type == "disk")] | length' <<< "$LSBLK_JSON")"
-    [[ "$count" -gt 0 ]] || return 1
+_json_escape() {
+    local str="${1-}"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    printf '%s' "$str"
 }
 
-# 解析并输出格式化的 JSON 数据
-output_json() {
-    jq '
-    def format_size(bytes):
-        if bytes == null or bytes == 0 then
-            ""
-        elif bytes >= 1000000000000 then
-            "\( (bytes / 1000000000000 | round) )TB"
-        elif bytes >= 1000000 then
-            "\( (bytes / 1000000000 | round) )GB"
-        elif bytes >= 1000 then
-            "\( (bytes / 1000000 | round) )MB"
-        else
-            "\(bytes)B"
-        end;
+# 根据rota和tran判断磁盘类型
+_disk_type() {
+    local rota="${1:-}" tran="${2:-}"
+    if [[ "$tran" == 'nvme' ]]; then
+        printf 'NVMe SSD'
+    elif [[ "$rota" == '0' ]]; then
+        printf 'SSD'
+    elif [[ "$rota" == '1' ]]; then
+        printf 'HDD'
+    else
+        printf 'DISK'
+    fi
+}
 
-    def disk_type(rota; tran):
-        if tran == "nvme" then
-            "NVMe SSD"
-        elif rota == "0" or rota == 0 then
-            "SSD"
-        elif rota == "1" or rota == 1 then
-            "HDD"
-        else
-            "DISK"
-        end;
+collect() {
+    command -v lsblk > /dev/null 2>&1 || {
+        printf '{"error":"lsblk not found"}\n' >&2
+        exit 1
+    }
 
-    [.blockdevices[]? | select(.type == "disk")] as $disks
-    | {
-        disk_count: ($disks | length),
-        disks: [
+    command -v jq > /dev/null 2>&1 || {
+        printf '{"error":"jq not found"}\n' >&2
+        exit 1
+    }
+
+    local lsblk_json disks_json
+    lsblk_json="$(lsblk -d -b -J -o NAME,VENDOR,MODEL,SIZE,ROTA,TRAN,SERIAL,TYPE 2> /dev/null || true)"
+
+    [[ -n "$lsblk_json" ]] || {
+        printf '{"error":"lsblk failed"}\n' >&2
+        exit 1
+    }
+
+    disks_json="$(jq -c '
+        [.blockdevices[]? | select(.type == "disk")] as $disks
+        | [
             $disks[] | {
                 vendor: ((.vendor // "") | gsub("^\\s+|\\s+$"; "")),
                 model: ((.model // "") | gsub("^\\s+|\\s+$"; "")),
-                size: format_size(.size // 0),
-                type: disk_type(.rota; .tran),
-                sn: ((.serial // "") | gsub("^\\s+|\\s+$"; ""))
+                size_bytes: (.size // 0),
+                type: (if .tran == "nvme" then "NVMe SSD"
+                       elif .rota == "0" then "SSD"
+                       elif .rota == "1" then "HDD"
+                       else "DISK" end),
+                serial: ((.serial // "") | gsub("^\\s+|\\s+$"; ""))
             }
-        ]
-    }' <<< "$LSBLK_JSON"
+        ]' <<< "$lsblk_json")"
+
+    jq -c --argjson disks "$disks_json" '{disks: $disks}' <<< '{}'
 }
 
-# 主程序逻辑入口
-main() {
-    check_command lsblk || {
-        echo "ERROR missing command lsblk" >&2
-        exit 1
-    }
-
-    check_command jq || {
-        echo "ERROR missing command jq" >&2
-        exit 1
-    }
-
-    collect_disk
-
-    validate_disk || {
-        echo "ERROR disk information unavailable or no disks found" >&2
-        exit 1
-    }
-
-    output_json
-}
-
-main "$@"
+collect

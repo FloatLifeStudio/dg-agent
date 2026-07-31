@@ -3,252 +3,195 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-declare -A NIC_PORTS
-declare -A NIC_MODEL
-declare -A NIC_SN
-declare -A NIC_TYPE
+# 权限检测
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf '{"error":"root required (use sudo)"}\n' >&2
+    exit 5
+fi
 
-get_pci_base() {
-    local pci="$1"
-
-    pci="${pci#0000:}"
-
-    echo "${pci%.*}"
+_trim() {
+    local str="${1-}"
+    str="${str#"${str%%[![:space:]]*}"}"
+    str="${str%"${str##*[![:space:]]}"}"
+    printf '%s' "$str"
 }
 
-get_pci_slot() {
-    local pci="$1"
-
-    echo "${pci#0000:}"
+_normalize() {
+    local val
+    val="$(_trim "${1-}")"
+    case "$val" in
+        ''|Unknown|unknown|None|'N/A'|NA|No|none) printf '' ;;
+        *) printf '%s' "$val" ;;
+    esac
 }
 
-get_model() {
-    local pci="$1"
+_json_escape() {
+    local str="${1-}"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    printf '%s' "$str"
+}
 
+# 提取 PCI 基地址 去掉 0000: 前缀和功能号
+_pci_base() {
+    local pci="${1#0000:}"
+    printf '%s' "${pci%.*}"
+}
+
+_pci_slot() {
+    local pci="${1#0000:}"
+    printf '%s' "$pci"
+}
+
+# 通过 lspci 获取型号
+_get_model() {
+    local pci="$1"
     local info
-
-    info=$(lspci -s "$pci" 2> /dev/null | head -1 || true)
-
+    info="$(lspci -s "$pci" 2>/dev/null | head -1 || true)"
     if [[ -z "$info" ]]; then
-        echo "Unknown"
+        printf 'Unknown'
         return
     fi
-
-    echo "$info" | sed -E 's/^.*: //'
+    info="${info#*: }"
+    printf '%s' "$info"
 }
 
-get_type() {
+# 根据型号判断网卡类型
+_get_type() {
     local model="$1"
-
     local lower
-
-    lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
-
-    if [[ "$lower" =~ ocp ]]; then
-        echo "OCP"
-    elif [[ "$lower" =~ rndc ]]; then
-        echo "rNDC"
-    elif [[ "$lower" =~ mezz ]]; then
-        echo "Mezzanine"
-    elif [[ "$lower" =~ lom ]]; then
-        echo "LOM"
-    else
-        echo "PCIe"
-    fi
+    lower="$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+        *ocp*)  printf 'OCP' ;;
+        *rndc*) printf 'rNDC' ;;
+        *mezz*) printf 'Mezzanine' ;;
+        *lom*)  printf 'LOM' ;;
+        *)      printf 'PCIe' ;;
+    esac
 }
 
-get_serial() {
+# 读取 PCI 设备的序列号
+_get_serial() {
     local base="$1"
-
-    local dev
-    local file
-
-    for dev in /sys/bus/pci/devices/0000:${base}.*; do
-
+    local dev file
+    for dev in "/sys/bus/pci/devices/0000:${base}".*; do
         file="$dev/serial_number"
-
         if [[ -f "$file" ]]; then
             cat "$file"
             return
         fi
-
     done
-
-    echo "Unknown"
+    printf 'Unknown'
 }
 
-get_current_speed() {
+# 通过 ethtool 获取当前协商速率
+_get_current_speed() {
     local iface="$1"
-
     local carrier
-
-    carrier=$(cat "/sys/class/net/${iface}/carrier" 2> /dev/null || echo 0)
-
-    if [[ "$carrier" != "1" ]]; then
-        echo "NotConnected"
+    carrier="$(cat "/sys/class/net/${iface}/carrier" 2>/dev/null || echo 0)"
+    if [[ "$carrier" != '1' ]]; then
+        printf 'NotConnected'
         return
     fi
-
     local speed
-
-    speed=$(ethtool "$iface" 2> /dev/null \
-        | awk '/Speed:/{
-            print $2
-        }' || true)
-
-    if [[ -z "$speed" || "$speed" == "Unknown!" ]]; then
-        echo "Unknown"
+    speed="$(ethtool "$iface" 2>/dev/null | awk '/Speed:/{print $2}' || true)"
+    if [[ -z "$speed" || "$speed" == 'Unknown!' ]]; then
+        printf 'Unknown'
     else
-        echo "$speed"
+        printf '%s' "$speed"
     fi
 }
 
-get_max_speed() {
+# 通过 ethtool 获取支持的最高速率
+_get_max_speed() {
     local iface="$1"
-
     local speed
-
-    speed=$(ethtool "$iface" 2> /dev/null \
-        | awk '
-        /Supported link modes:/ {
-            flag=1
-            next
-        }
-
-        flag && /^[[:space:]]+[0-9]+base/ {
-            print
-        }
-
-        flag && !/base/ {
-            exit
-        }
-        ' \
-        | grep -oE '[0-9]+' \
-        | sort -nr \
-        | head -1 || true)
+    speed="$(ethtool "$iface" 2>/dev/null | awk '
+        /Supported link modes:/ { flag=1; next }
+        flag && /^[[:space:]]+[0-9]+base/ { print }
+        flag && !/base/ { exit }
+    ' | grep -oE '[0-9]+' | sort -nr | head -1 || true)"
 
     if [[ -z "$speed" ]]; then
-        echo "Unknown"
+        printf 'Unknown'
     else
-        echo "${speed}Mb/s"
+        printf '%sMb/s' "$speed"
     fi
 }
 
-get_port_json() {
-    local iface="$1"
-    local pci="$2"
+main() {
+    command -v jq >/dev/null 2>&1 || {
+        printf '{"error":"jq not found"}\n' >&2
+        exit 1
+    }
 
-    local mac
-    local current
-    local max
+    # 按 PCI 基地址聚合端口信息
+    declare -A nic_ports
+    declare -A nic_model
+    declare -A nic_sn
+    declare -A nic_type
 
-    mac=$(cat "/sys/class/net/${iface}/address" 2> /dev/null || echo "Unknown")
-
-    current=$(get_current_speed "$iface")
-
-    max=$(get_max_speed "$iface")
-
-    jq -n \
-        --arg slot "$(get_pci_slot "$pci")" \
-        --arg interface "$iface" \
-        --arg mac "$mac" \
-        --arg current "$current" \
-        --arg max "$max" \
-        '
-        {
-            slot:$slot,
-            interface:$interface,
-            mac:$mac,
-            current_speed:$current,
-            max_speed:$max
-        }
-        '
-}
-
-collect() {
-    local path
-    local iface
-    local pci
-    local base
+    local path iface pci base
+    local mac current max port_json
 
     for path in /sys/class/net/*; do
-
-        iface=$(basename "$path")
-
+        iface="$(basename "$path")"
         [[ -e "$path/device" ]] || continue
 
-        pci=$(basename "$(readlink -f "$path/device")")
+        pci="$(basename "$(readlink -f "$path/device")")"
 
+        # 校验 PCI 地址格式
         if [[ ! "$pci" =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$ ]]; then
             continue
         fi
 
-        base=$(get_pci_base "$pci")
+        base="$(_pci_base "$pci")"
+        mac="$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo 'Unknown')"
+        current="$(_get_current_speed "$iface")"
+        max="$(_get_max_speed "$iface")"
 
-        NIC_PORTS["$base"]+=$(get_port_json "$iface" "$pci")$'\n'
+        port_json="{\"slot\":\"$(_pci_slot "$pci")\","
+        port_json+="\"interface\":\"$iface\","
+        port_json+="\"mac\":\"$mac\","
+        port_json+="\"current_speed\":\"$current\","
+        port_json+="\"max_speed\":\"$max\"}"
 
-        if [[ -z "${NIC_MODEL[$base]:-}" ]]; then
+        nic_ports["$base"]+="${port_json}"$'\n'
 
-            NIC_MODEL["$base"]=$(get_model "$base")
-
-            NIC_SN["$base"]=$(get_serial "$base")
-
-            NIC_TYPE["$base"]=$(get_type "${NIC_MODEL[$base]}")
-
+        if [[ -z "${nic_model[$base]:-}" ]]; then
+            nic_model["$base"]="$(_get_model "$base")"
+            nic_sn["$base"]="$(_get_serial "$base")"
+            nic_type["$base"]="$(_get_type "${nic_model[$base]}")"
         fi
-
-    done
-}
-
-build_json() {
-    local tmp
-
-    tmp=$(mktemp)
-
-    local base
-
-    for base in "${!NIC_PORTS[@]}"; do
-
-        echo "${NIC_PORTS[$base]}" \
-            | jq -s \
-                --arg slot "$base" \
-                --arg model "${NIC_MODEL[$base]}" \
-                --arg sn "${NIC_SN[$base]}" \
-                --arg type "${NIC_TYPE[$base]}" \
-                '
-            {
-                slot:$slot,
-                name:$model,
-                model:$model,
-                sn:$sn,
-                type:$type,
-                port_count:length,
-                ports:.
-            }
-            ' >> "$tmp"
-
     done
 
-    jq -s '
-    {
-        nic_count:length,
-        nics:.
-    }
-    ' "$tmp"
+    # 构建网卡JSON
+    local nics_json='' first=1 base
 
-    rm -f "$tmp"
-}
+    for base in "${!nic_ports[@]}"; do
+        # 将换行分隔的端口JSON转为数组
+        local ports_arr
+        ports_arr="$(printf '%s\n' "${nic_ports[$base]}" | sed '/^$/d' | jq -s '.')"
 
-main() {
+        [[ "$first" -eq 0 ]] && nics_json+=','
+        first=0
 
-    command -v jq > /dev/null || {
-        echo '{"error":"jq not installed"}'
-        exit 1
-    }
+        nics_json+="$(jq -c -n \
+            --arg slot "$base" \
+            --arg model "${nic_model[$base]}" \
+            --arg sn "${nic_sn[$base]}" \
+            --arg type "${nic_type[$base]}" \
+            --argjson ports "$ports_arr" '{
+                slot: $slot,
+                model: $model,
+                sn: $sn,
+                type: $type,
+                port_count: ($ports | length),
+                ports: $ports
+            }')"
+    done
 
-    collect
-
-    build_json
+    jq -c -n --argjson nics "[$nics_json]" '{nics: $nics}'
 }
 
 main "$@"

@@ -1,183 +1,246 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -euo pipefail
-IFS=$'\n\t'
+clear >/dev/null 2>&1 || true
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 权限检测 --help和空参数不需要root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    for _a in "$@"; do
+        if [[ "$_a" == "--help" || "$_a" == "-h" ]]; then
+            cat << 'EOF'
+dg-agent — 轻量级硬件资产采集框架
+
+用法:
+  dg-agent.sh [选项] [模块...]
+
+选项:
+  --all               运行所有模块
+  --output <file>     结果写入文件 默认 stdout
+  --verbose, -v       详细输出 日志写入 stderr
+  --help, -h          显示帮助
+
+模块:
+  --os                操作系统
+  --cpu               CPU 信息
+  --memory            内存信息
+  --disk              磁盘信息
+  --gpu               GPU 信息
+  --nic               网卡信息
+  --power             电源信息
+
+示例:
+  sudo ./dg-agent.sh --cpu --os
+  sudo ./dg-agent.sh --all --output /tmp/asset.json --verbose
+  sudo bash modules/os.sh               # 单模块独立运行
+EOF
+            exit 0
+        fi
+    done
+    if [[ "$#" -eq 0 ]]; then
+        printf '{"error":"root required","hint":"use sudo or specify --help"}\n' >&2
+        exit 5
+    fi
+    exec sudo bash "$0" "$@"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 readonly MODULE_DIR="${SCRIPT_DIR}/modules"
-readonly FORMATTER="${SCRIPT_DIR}/lib/formatter.sh"
+readonly LIB_DIR="${SCRIPT_DIR}/lib"
+readonly VERSION='1.0.0'
 
-json_output=false
-declare -a modules=()
+# shellcheck source=./lib/cleaner.sh
+source "${LIB_DIR}/cleaner.sh"
+# shellcheck source=./lib/logger.sh
+source "${LIB_DIR}/logger.sh"
 
-exit_code=0
+declare -a SELECTED_MODULES=()
+OUTPUT_FILE=''
+VERBOSE=false
+EXIT_CODE=0
 
-error() {
-    echo "ERROR $*" >&2
-}
+# 可用模块列表
+readonly ALL_MODULES=(os cpu memory disk gpu nic power)
 
-usage() {
-    cat << EOF
-Usage:
-  $0 [options]
+_usage() {
+    cat << 'EOF'
+dg-agent — 轻量级硬件资产采集框架
 
-Options:
-  --all             Run all modules
-  --json            Output json format
-  --help            Show help
+用法:
+  dg-agent.sh [选项] [模块...]
 
-Modules:
-  --<module>        Run specified module
+选项:
+  --all               运行所有模块
+  --output <file>     结果写入文件 默认 stdout
+  --verbose, -v       详细输出 日志写入 stderr
+  --help, -h          显示帮助
 
-Examples:
-  $0 --cpu
-  $0 --cpu --memory --disk
-  $0 --all --json
+模块:
+  --os                操作系统
+  --cpu               CPU 信息
+  --memory            内存信息
+  --disk              磁盘信息
+  --gpu               GPU 信息
+  --nic               网卡信息
+  --power             电源信息
+
+示例:
+  ./dg-agent.sh --cpu --os
+  ./dg-agent.sh --all --output /tmp/asset.json --verbose
+  modules/os.sh                          # 单模块独立运行
 EOF
 }
 
-module_exists() {
-
-    local module="$1"
-
-    [ -f "${MODULE_DIR}/${module}.sh" ]
-}
-
-add_module() {
-
-    local module="$1"
-
-    if ! module_exists "$module"; then
-        error "module not found: ${module}"
-        exit_code=1
-        return
-    fi
-
-    modules+=("$module")
-}
-
-discover_modules() {
-
-    local module_file
-    local module_name
-
-    for module_file in "${MODULE_DIR}"/*.sh; do
-        [ -f "$module_file" ] || continue
-
-        module_name="$(basename "$module_file" .sh)"
-
-        modules+=("$module_name")
-    done
-}
-
-parse_args() {
-
-    if [ "$#" -eq 0 ]; then
-        usage
-        exit 1
-    fi
-
-    while [ "$#" -gt 0 ]; do
+_parse_args() {
+    while [[ "$#" -gt 0 ]]; do
         case "$1" in
-
-            --json)
-
-                json_output=true
+            --output)
+                shift
+                if [[ "$#" -eq 0 ]]; then
+                    log_error '--output 需要文件路径参数'
+                    exit 2
+                fi
+                OUTPUT_FILE="$1"
                 ;;
-
+            --verbose|-v)
+                VERBOSE=true
+                ;;
             --all)
-
-                discover_modules
+                for m in "${ALL_MODULES[@]}"; do
+                    _add_module "$m"
+                done
                 ;;
-
-            --help | -h)
-
-                usage
+            --help|-h)
+                _usage
                 exit 0
                 ;;
-
-            --*)
-
-                add_module "${1#--}"
+            --os|--cpu|--memory|--disk|--gpu|--nic|--power)
+                _add_module "${1#--}"
                 ;;
-
             *)
-
-                error "invalid argument: $1"
-                usage
-                exit 1
+                log_error "无效参数: $1"
+                _usage
+                exit 2
                 ;;
-
         esac
-
         shift
     done
 
-    if [ "${#modules[@]}" -eq 0 ]; then
-        error "no module specified"
-        exit 1
+    if [[ "${#SELECTED_MODULES[@]}" -eq 0 ]]; then
+        log_error '未指定任何模块 (使用 --all 运行所有, --help 查看帮助)'
+        _usage
+        exit 2
     fi
 }
 
-run_modules() {
+_add_module() {
+    local module="$1"
+    local script="${MODULE_DIR}/${module}.sh"
 
-    local module
-    local module_script
-    local output
-
-    for module in "${modules[@]}"; do
-        module_script="${MODULE_DIR}/${module}.sh"
-
-        if output=$(bash "$module_script"); then
-            printf '%s\n' "$output"
-        else
-            error "module failed: ${module}"
-            exit_code=1
-        fi
-
-    done
-}
-
-run_json_formatter() {
-
-    local input_file
-
-    input_file="$(mktemp)"
-
-    if run_modules > "$input_file"; then
-        :
-    else
-        exit_code=1
-    fi
-
-    if [ ! -f "$FORMATTER" ]; then
-        rm -f "$input_file"
-        error "formatter not found"
+    if [[ ! -f "$script" ]]; then
+        log_error "模块不存在: ${module} (${script})"
+        EXIT_CODE=3
         return 1
     fi
 
-    if ! bash "$FORMATTER" json < "$input_file"; then
-        exit_code=1
+    # 去重
+    local m
+    for m in "${SELECTED_MODULES[@]}"; do
+        [[ "$m" == "$module" ]] && return 0
+    done
+
+    SELECTED_MODULES+=("$module")
+    return 0
+}
+
+_run_module() {
+    local module="$1"
+    local script="${MODULE_DIR}/${module}.sh"
+    local output rc
+
+    log_step "采集: ${module}"
+
+    # 确保脚本可执行
+    if [[ ! -x "$script" ]]; then
+        chmod +x "$script" 2>/dev/null || true
     fi
 
-    rm -f "$input_file"
+    output="$(bash "$script" 2>&1)" || rc=$?
+    rc=${rc:-0}
+
+    if [[ "$rc" -ne 0 ]]; then
+        log_warn "模块 ${module} 异常退出 (exit: $rc)"
+        EXIT_CODE=6
+        # 返回错误占位JSON
+        printf '{"error":"collect failed (exit: %d)"}' "$rc"
+        return 1
+    fi
+
+    # 验证输出是否为合法JSON
+    if ! printf '%s' "$output" | jq empty 2>/dev/null; then
+        log_warn "模块 ${module} 输出非合法 JSON"
+        EXIT_CODE=7
+        printf '{"error":"invalid json output"}'
+        return 1
+    fi
+
+    log_ok "模块 ${module} 完成"
+    printf '%s' "$output"
+    return 0
+}
+
+# 构建模块名到输出的顶层映射 {os:{...},cpu:{...}}
+_build_aggregate() {
+    local result='{' first=1 module raw
+
+    for module in "${SELECTED_MODULES[@]}"; do
+        raw="$(_run_module "$module")" || true
+
+        [[ "$first" -eq 0 ]] && result+=','
+        first=0
+
+        result+="\"${module}\":${raw}"
+    done
+
+    result+='}'
+
+    # 格式化输出
+    printf '%s' "$result" | jq '.'
+}
+
+_write_output() {
+    local content="$1"
+
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        if printf '%s\n' "$content" > "$OUTPUT_FILE"; then
+            log_info "结果已写入: ${OUTPUT_FILE}"
+        else
+            log_error "写入文件失败: ${OUTPUT_FILE}"
+            EXIT_CODE=8
+        fi
+    else
+        printf '%s\n' "$content"
+    fi
 }
 
 main() {
+    _parse_args "$@"
 
-    parse_args "$@"
+    # 初始化日志 _parseArgs已设置VERBOSE
+    logger_init "$VERBOSE"
 
-    if [ "$json_output" = true ]; then
+    [[ "$VERBOSE" == true ]] && {
+        log_info "dg-agent v${VERSION}"
+        log_info "脚本路径: ${SCRIPT_DIR}"
+        log_info "选中模块: ${SELECTED_MODULES[*]}"
+        [[ -n "$OUTPUT_FILE" ]] && log_info "输出文件: ${OUTPUT_FILE}"
+    }
 
-        run_json_formatter
+    local output
+    output="$(_build_aggregate)"
 
-    else
+    _write_output "$output"
 
-        run_modules
-
-    fi
-
-    return "$exit_code"
+    return "$EXIT_CODE"
 }
 
 main "$@"

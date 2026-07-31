@@ -3,99 +3,117 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# 校验外部依赖
-check_deps() {
-    command -v jq > /dev/null 2>&1 || {
-        echo "ERROR: jq is required." >&2
-        exit 1
-    }
+# 权限检测
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf '{"error":"root required (use sudo)"}\n' >&2
+    exit 5
+fi
+
+_trim() {
+    local str="${1-}"
+    str="${str#"${str%%[![:space:]]*}"}"
+    str="${str%"${str##*[![:space:]]}"}"
+    printf '%s' "$str"
 }
 
-# 格式化显存大小 (24576 MiB -> 24GB, 8192 MiB -> 8GB)
-format_vram() {
+_normalize() {
+    local val
+    val="$(_trim "${1-}")"
+    case "$val" in
+        ''|Unknown|unknown|None|'N/A'|NA|'[N/A]'|No|none) printf '' ;;
+        *) printf '%s' "$val" ;;
+    esac
+}
+
+_json_escape() {
+    local str="${1-}"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    printf '%s' "$str"
+}
+
+# MiB 转 GB 格式化
+_format_vram() {
     local mb="${1:-0}"
-    if ((mb >= 1024)); then
-        echo "$(((mb + 512) / 1024))GB"
-    elif ((mb > 0)); then
-        echo "${mb}MB"
+    if (( mb >= 1024 )); then
+        printf '%dGB' "$(((mb + 512) / 1024))"
+    elif (( mb > 0 )); then
+        printf '%dMB' "$mb"
     else
-        echo ""
+        printf ''
     fi
 }
 
-# 采集 NVIDIA 显卡信息
-collect_nvidia() {
-    command -v nvidia-smi > /dev/null 2>&1 || return 1
+# 采集 NVIDIA 显卡
+_collect_nvidia() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
 
-    local query_fields="index,gpu_name,uuid,pci.bus_id,vbios_version,serial,memory.total,driver_version"
     local raw
-    raw="$(nvidia-smi --query-gpu="$query_fields" --format=csv,noheader,nounits 2> /dev/null)" || return 1
+    raw="$(nvidia-smi --query-gpu=index,gpu_name,uuid,pci.bus_id,vbios_version,serial,memory.total,driver_version \
+        --format=csv,noheader,nounits 2>/dev/null)" || return 1
+
     [[ -n "$raw" ]] || return 1
 
     local index name uuid bus vbios serial vram driver
-    local json_items=()
+    local items='' first=1
 
     while IFS=',' read -r index name uuid bus vbios serial vram driver; do
-        # 清理多余空格
-        index="${index// /}"
-        name="$(echo "$name" | xargs)"
-        uuid="${uuid// /}"
-        bus="${bus// /}"
-        vbios="${vbios// /}"
-        serial="$(echo "$serial" | xargs)"
-        vram="${vram// /}"
-        driver="${driver// /}"
+        index="$(_trim "$index")"
+        name="$(_trim "$name")"
+        uuid="$(_trim "$uuid")"
+        bus="$(_trim "$bus")"
+        vbios="$(_trim "$vbios")"
+        serial="$(_normalize "$serial")"
+        vram="$(_trim "$vram")"
+        driver="$(_trim "$driver")"
 
-        # 处理 N/A 占位符
-        [[ "$serial" =~ ^(\[N/A\]|N/A)$ ]] && serial=""
+        [[ "$first" -eq 0 ]] && items+=','
+        first=0
 
-        json_items+=("$(jq -nc \
-            --arg vendor "NVIDIA" \
-            --arg index "$index" \
-            --arg name "$name" \
-            --arg uuid "$uuid" \
-            --arg bus "$bus" \
-            --arg vbios "$vbios" \
-            --arg serial "$serial" \
-            --arg memory "$(format_vram "$vram")" \
-            --arg driver "$driver" \
-            '{vendor: $vendor, index: $index, name: $name, uuid: $uuid, pci_bus_id: $bus, vbios_version: $vbios, serial: $serial, memory: $memory, driver_version: $driver}')")
+        items+="{\"vendor\":\"NVIDIA\",\"index\":\"$index\","
+        items+="\"name\":\"$(_json_escape "$name")\","
+        items+="\"uuid\":\"$uuid\","
+        items+="\"pci_bus_id\":\"$bus\","
+        items+="\"vbios\":\"$vbios\","
+        items+="\"serial\":\"$(_json_escape "$serial")\","
+        items+="\"memory\":\"$(_format_vram "$vram")\","
+        items+="\"driver\":\"$driver\"}"
+
     done <<< "$raw"
 
-    printf '%s\n' "${json_items[@]}" | jq -s '.'
+    printf '[%s]\n' "$items"
+    return 0
 }
 
-# 采集 AMD 显卡信息 (rocm-smi)
-collect_amd() {
-    command -v rocm-smi > /dev/null 2>&1 || return 1
+# 采集 AMD 显卡
+_collect_amd() {
+    command -v rocm-smi >/dev/null 2>&1 || return 1
+
+    command -v jq >/dev/null 2>&1 || return 1
 
     local raw
-    raw="$(rocm-smi --showid --showproductname --showbus --showdriverversion --json 2> /dev/null)" || return 1
-    [[ -n "$raw" && "$raw" != "{}" ]] || return 1
+    raw="$(rocm-smi --showid --showproductname --showbus --showdriverversion --json 2>/dev/null)" || return 1
 
-    # 将 rocm-smi 的字典对象归一化为通用数组结构
-    jq '[to_entries[] | {
+    [[ -n "$raw" && "$raw" != '{}' ]] || return 1
+
+    jq -c '[to_entries[] | {
         vendor: "AMD",
         index: .key,
-        name: .value["Card series"] // .value["Product Name"] // "",
-        uuid: .value["Unique ID"] // "",
-        pci_bus_id: .value["PCI Bus"] // "",
-        vbios_version: .value["VBIOS version"] // "",
-        serial: .value["Serial Number"] // "",
+        name: (.value["Card series"] // .value["Product Name"] // ""),
+        uuid: (.value["Unique ID"] // ""),
+        pci_bus_id: (.value["PCI Bus"] // ""),
+        vbios: (.value["VBIOS version"] // ""),
+        serial: (.value["Serial Number"] // ""),
         memory: "",
-        driver_version: .value["Driver version"] // ""
+        driver: (.value["Driver version"] // "")
     }]' <<< "$raw"
 }
 
-# Fallback Pipeline
 main() {
-    check_deps
+    _collect_nvidia && exit 0
+    _collect_amd   && exit 0
 
-    collect_nvidia && exit 0
-    collect_amd && exit 0
-
-    # 无设备时的默认保底输出
-    echo "[]"
+    printf '[]\n'
 }
 
 main "$@"

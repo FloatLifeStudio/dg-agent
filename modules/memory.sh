@@ -3,166 +3,136 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# 检查命令是否存在
-check_command() {
-    command -v "$1" > /dev/null 2>&1
+# 权限检测
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    printf '{"error":"root required (use sudo)"}\n' >&2
+    exit 5
+fi
+
+_trim() {
+    local str="${1-}"
+    str="${str#"${str%%[![:space:]]*}"}"
+    str="${str%"${str##*[![:space:]]}"}"
+    printf '%s' "$str"
 }
 
-# 去除字符串首尾空白
-trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
+_normalize() {
+    local val
+    val="$(_trim "${1-}")"
+    case "$val" in
+        ''|Unknown|unknown|None|'N/A'|NA|'[N/A]'|No|none|'Not Specified') printf '' ;;
+        *) printf '%s' "$val" ;;
+    esac
 }
 
-# 全局变量保存采集与清洗后的数据
-DMI_MEM_OUT=""
-MEMINFO_OUT=""
-CLEANED_MEM_DATA=""
+_json_escape() {
+    local str="${1-}"
+    str="${str//\\/\\\\}"
+    str="${str//\"/\\\"}"
+    printf '%s' "$str"
+}
 
-# 采集内存信息
-collect_memory() {
-    DMI_MEM_OUT="$(dmidecode -t memory 2> /dev/null || true)"
-    if [[ -r /proc/meminfo ]]; then
-        MEMINFO_OUT="$(cat /proc/meminfo)"
+collect() {
+    command -v dmidecode >/dev/null 2>&1 || {
+        printf '{"error":"dmidecode not found"}\n' >&2
+        exit 1
+    }
+
+    local dmi_raw meminfo_raw
+    dmi_raw="$(dmidecode -t memory 2>/dev/null || true)"
+    meminfo_raw="$(cat /proc/meminfo 2>/dev/null || true)"
+
+    [[ -n "$meminfo_raw" ]] || {
+        printf '{"error":"meminfo unavailable"}\n' >&2
+        exit 1
+    }
+
+    # 总大小和可用大小
+    local total_kb avail_kb
+    total_kb="$(grep -iE '^MemTotal:' <<< "$meminfo_raw" | awk '{print $2}' || echo 0)"
+    avail_kb="$(grep -iE '^MemAvailable:' <<< "$meminfo_raw" | awk '{print $2}' || echo 0)"
+
+    # 解析 DIMM 模块
+    local modules_json=''
+    local first=1
+
+    if grep -q 'Memory Device' <<< "$dmi_raw"; then
+        local vendor model type size speed configured_speed serial
+        local IFS_BAK="$IFS"
+        IFS=''
+        local record in_record=false
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(_trim "$line")"
+
+            if [[ "$line" == 'Memory Device' ]]; then
+                # 输出上一个记录
+                if [[ "$in_record" == true && -n "${size:-}" && "$size" =~ [0-9] ]]; then
+                    [[ "$first" -eq 0 ]] && modules_json+=','
+                    first=0
+
+                    modules_json+="{\"vendor\":\"$(_json_escape "${vendor:-}")\","
+                    modules_json+="\"model\":\"$(_json_escape "${model:-}")\","
+                    modules_json+="\"type\":\"$(_json_escape "${type:-DRAM}")\","
+                    modules_json+="\"capacity\":\"$(_json_escape "${size:-}")\","
+                    modules_json+="\"speed\":\"$(_json_escape "${speed:-}")\","
+                    modules_json+="\"serial\":\"$(_json_escape "${serial:-}")\"}"
+
+                fi
+                in_record=true
+                vendor=''; model=''; type=''; size=''; speed=''; configured_speed=''; serial=''
+                continue
+            fi
+
+            [[ "$in_record" != true ]] && continue
+            [[ -z "$line" ]] && continue
+
+            case "$line" in
+                Size:*)
+                    size="$(_trim "${line#Size:}")"
+                    size="${size// /}"
+                    ;;
+                Manufacturer:*)
+                    vendor="$(_normalize "${line#Manufacturer:}")"
+                    ;;
+                'Part Number:'*)
+                    model="$(_normalize "${line#Part Number:}")"
+                    ;;
+                Type:*)
+                    type="$(_normalize "${line#Type:}")"
+                    [[ -z "$type" || "$type" == 'Unknown' ]] && type='DRAM'
+                    ;;
+                Speed:*)
+                    speed="$(_trim "${line#Speed:}")"
+                    ;;
+                'Configured Memory Speed:'*|'Configured Clock Speed:'*)
+                    configured_speed="$(_trim "${line#*:}")"
+                    ;;
+                'Serial Number:'*)
+                    serial="$(_normalize "${line#Serial Number:}")"
+                    ;;
+            esac
+        done <<< "$dmi_raw"
+
+        # 最后一个记录
+        if [[ "$in_record" == true && -n "${size:-}" && "$size" =~ [0-9] ]]; then
+            [[ "$first" -eq 0 ]] && modules_json+=','
+            modules_json+="{\"vendor\":\"$(_json_escape "${vendor:-}")\","
+            modules_json+="\"model\":\"$(_json_escape "${model:-}")\","
+            modules_json+="\"type\":\"$(_json_escape "${type:-DRAM}")\","
+            modules_json+="\"capacity\":\"$(_json_escape "${size:-}")\","
+            modules_json+="\"speed\":\"$(_json_escape "${speed:-}")\","
+            modules_json+="\"serial\":\"$(_json_escape "${serial:-}")\"}"
+        fi
+
+        IFS="$IFS_BAK"
     fi
+
+    printf \
+        '{"total_bytes":%d,"available_bytes":%d,"modules":[%s]}\n' \
+        "$((total_kb * 1024))" \
+        "$((avail_kb * 1024))" \
+        "$modules_json"
 }
 
-# 校验采集数据是否有效
-validate_memory() {
-    [[ -n "$MEMINFO_OUT" ]] || return 1
-}
-
-# 清洗内存信息提取标准字段
-clean_memory_data() {
-    if grep -q "Memory Device" <<< "$DMI_MEM_OUT"; then
-        CLEANED_MEM_DATA="$(
-            awk '
-                BEGIN { RS = "Memory Device"; FS = "\n" }
-                /Size: [0-9]+/ {
-                    size = ""; vendor = ""; model = ""; type = ""; speed = ""; configured_speed = ""; serial = ""
-                    
-                    for (i = 1; i <= NF; i++) {
-                        line = $i
-                        sub(/^[ \t]+/, "", line)
-                        sub(/[ \t]+$/, "", line)
-                        
-                        if (line ~ /^Size:/) {
-                            split(line, arr, ":")
-                            size = arr[2]
-                        } else if (line ~ /^Manufacturer:/) {
-                            split(line, arr, ":")
-                            vendor = arr[2]
-                        } else if (line ~ /^Part Number:/) {
-                            split(line, arr, ":")
-                            model = arr[2]
-                        } else if (line ~ /^Type:/) {
-                            split(line, arr, ":")
-                            type = arr[2]
-                        } else if (line ~ /^Speed:/) {
-                            split(line, arr, ":")
-                            speed = arr[2]
-                        } else if (line ~ /^Configured (Memory Speed|Clock Speed):/) {
-                            split(line, arr, ":")
-                            configured_speed = arr[2]
-                        } else if (line ~ /^Serial Number:/) {
-                            split(line, arr, ":")
-                            serial = arr[2]
-                        }
-                    }
-
-                    gsub(/^[ \t]+|[ \t]+$/, "", size)
-                    gsub(/^[ \t]+|[ \t]+$/, "", vendor)
-                    gsub(/^[ \t]+|[ \t]+$/, "", model)
-                    gsub(/^[ \t]+|[ \t]+$/, "", type)
-                    gsub(/^[ \t]+|[ \t]+$/, "", speed)
-                    gsub(/^[ \t]+|[ \t]+$/, "", configured_speed)
-                    gsub(/^[ \t]+|[ \t]+$/, "", serial)
-
-                    if (vendor ~ /^(NO|Unknown|[Nn]\/[Aa])/) vendor = ""
-                    if (model ~ /^(NO|Unknown|[Nn]\/[Aa])/) model = ""
-                    if (serial ~ /^(NO|Unknown|[Nn]\/[Aa])/) serial = ""
-                    if (type == "" || type == "Unknown") type = "DRAM"
-
-                    gsub(/[ \t]+/, "", size)
-
-                    print vendor "\t" model "\t" type "\t" size "\t" speed "\t" configured_speed "\t" serial
-                }
-            ' <<< "$DMI_MEM_OUT"
-        )"
-    fi
-}
-
-# 格式化输出 JSON 数据
-output_json() {
-    local total_kb avail_kb total_bytes avail_bytes
-    total_kb="$(grep -iE '^MemTotal:' <<< "$MEMINFO_OUT" | awk '{print $2}' || echo "0")"
-    avail_kb="$(grep -iE '^MemAvailable:' <<< "$MEMINFO_OUT" | awk '{print $2}' || echo "0")"
-
-    total_bytes=$((total_kb * 1024))
-    avail_bytes=$((avail_kb * 1024))
-
-    jq -Rn \
-        --argjson total_bytes "$total_bytes" \
-        --argjson avail_bytes "$avail_bytes" '
-    def format_declared_size(bytes):
-        if bytes == null or bytes == 0 then
-            ""
-        elif bytes >= 1000000000000 then
-            "\( (bytes / 1000000000000 | round) )TB"
-        elif bytes >= 100000000 then
-            "\( (bytes / 1000000000 | round) )GB"
-        elif bytes >= 100000 then
-            "\( (bytes / 1000000 | round) )MB"
-        else
-            "\(bytes)B"
-        end;
-
-    [
-        inputs
-        | select(length > 0)
-        | split("\t") as $fields
-        | {
-            vendor: $fields[0],
-            model: $fields[1],
-            type: $fields[2],
-            capacity: $fields[3],
-            speed: $fields[4],
-            configured_speed: $fields[5],
-            serial: $fields[6]
-        }
-    ] as $modules
-    | {
-        memory_count: ($modules | length),
-        installed: format_declared_size($total_bytes),
-        available: format_declared_size($avail_bytes),
-        modules: $modules
-    }' <<< "$CLEANED_MEM_DATA"
-}
-
-# 主程序逻辑入口
-main() {
-    check_command dmidecode || {
-        echo "ERROR missing command dmidecode" >&2
-        exit 1
-    }
-
-    check_command jq || {
-        echo "ERROR missing command jq" >&2
-        exit 1
-    }
-
-    collect_memory
-
-    validate_memory || {
-        echo "ERROR memory information unavailable" >&2
-        exit 1
-    }
-
-    clean_memory_data
-
-    output_json
-}
-
-main "$@"
+collect

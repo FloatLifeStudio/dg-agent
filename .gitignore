@@ -1,58 +1,25 @@
-# ============================================
-# OS generated files (macOS, Windows, Linux)
-# ============================================
+# OS generated files
 .DS_Store
-.AppleDouble
-.LSOverride
-._*
-Thumbs.db
-ehthumbs.db
+.Thumbs.db
 Desktop.ini
-$RECYCLE.BIN/
 
-# ============================================
-# Editor backup / temporary files (Vim, generic)
-# ============================================
+# Editor temp files
 *.swp
 *.swo
 *~
 *.bak
-*.orig
-*.backup
 
-# ============================================
-# IDE configuration (JetBrains, VS Code)
-# ============================================
+# IDE
 .idea/
-*.iml
-*.iws
 .vscode/
-*.code-workspace
 
-# ============================================
-# Logs and temporary runtime output
-# ============================================
+# Runtime artifacts
 *.log
-*.test
-tmp/
-temp/
-output/
-results/
-*.tmp
-*.out
-*.pid
-*.cache
+cache/
+logs/
 
-# ============================================
-# Sensitive data / credentials (security)
-# ============================================
+# Sensitive
 .env
-.env.local
-.env.*.local
 *.key
 *.pem
-*.crt
-*.p12
-*.pfx
 secrets/
-credentials/
